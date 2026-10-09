@@ -29,9 +29,11 @@ interface WorkerInput {
 	root: string;
 	version: string;
 	commit: string;
+	/** Self-build CI gate: signing and metadata failures must fail the build. */
+	strict?: boolean;
 }
 
-const { platform, distDir, root, version, commit } = workerData as WorkerInput;
+const { platform, distDir, root, version, commit, strict } = workerData as WorkerInput;
 
 function log(message: string) {
 	parentPort!.postMessage({ type: "log", message });
@@ -44,12 +46,15 @@ function log(message: string) {
 function findRcodesign(): string | null {
 	try {
 		const check = Bun.spawnSync(["rcodesign", "--version"], {
+			timeout: strict ? 10_000 : undefined,
 			stdout: "pipe",
 			stderr: "pipe",
 		});
 		if (check.exitCode === 0) return "rcodesign";
 	} catch {}
 
+	// Self-builds may not use a developer's untracked ~/.narrafork tooling.
+	if (strict) return null;
 	const localPath = join(homedir(), ".narrafork", "bin", "rcodesign");
 	if (existsSync(localPath)) {
 		try {
@@ -68,6 +73,7 @@ function adHocSign(filePath: string): boolean {
 	const rcodesign = findRcodesign();
 	if (rcodesign) {
 		const result = Bun.spawnSync([rcodesign, "sign", filePath], {
+			timeout: strict ? 120_000 : undefined,
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -81,6 +87,7 @@ function adHocSign(filePath: string): boolean {
 
 	if (process.platform === "darwin") {
 		const result = Bun.spawnSync(["codesign", "--force", "--sign", "-", filePath], {
+			timeout: strict ? 120_000 : undefined,
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -153,11 +160,33 @@ const outfile = join(distDir, platform.name);
 const buildDate = new Date().toISOString();
 
 // 1. macOS signing (must happen before hashing so digests match the final file)
+let signed: boolean | undefined;
+let signatureVerified: boolean | null | undefined;
 if (platform.target.includes("darwin")) {
-	if (!adHocSign(outfile)) {
-		log(
-			`⚠ Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(root, outfile)}`,
-		);
+	signed = adHocSign(outfile);
+	if (!signed) {
+		const hint = `Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(root, outfile)}`;
+		if (strict) throw new Error(hint);
+		log(`⚠ ${hint}`);
+	}
+	// Only a native host can verify the signature; a cross build reports "not verifiable"
+	// instead of claiming a verification that never ran.
+	if (signed && process.platform === "darwin") {
+		const verify = Bun.spawnSync(["codesign", "--verify", "--strict", outfile], {
+			timeout: 120_000,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		signatureVerified = verify.exitCode === 0;
+		if (!signatureVerified) {
+			const stderr = new TextDecoder().decode(verify.stderr).trim();
+			if (strict) throw new Error(`codesign --verify failed: ${stderr}`);
+			log(`⚠ codesign --verify failed: ${stderr}`);
+		} else {
+			log("✓ Ad-hoc signature verified (codesign --verify --strict)");
+		}
+	} else if (signed) {
+		signatureVerified = null;
 	}
 }
 
@@ -179,11 +208,12 @@ try {
 	log(`✓ Metadata: ${relative(root, metadataPath)} (sha256 ${metadata.sha256.slice(0, 12)}…)`);
 } catch (err) {
 	const message = err instanceof Error ? err.message : String(err);
+	if (strict) throw new Error(`Metadata generation failed for ${platform.platformId}: ${message}`);
 	log(`⚠ Metadata generation failed for ${platform.platformId}: ${message}`);
 }
 
 // 3. Zstd patch
-const prevBinary = findPreviousVersionBinary(platform.name, version);
+const prevBinary = strict ? null : findPreviousVersionBinary(platform.name, version);
 if (prevBinary) {
 	log(`→ Generating zstd patch from ${relative(root, prevBinary.path)}...`);
 	try {
@@ -226,4 +256,4 @@ const latestYml = {
 	file: { url: platform.name, size: fileSize, sha512: fileSha512 },
 };
 
-parentPort!.postMessage({ type: "done", latestYml, metadata });
+parentPort!.postMessage({ type: "done", latestYml, metadata, signed, signatureVerified });

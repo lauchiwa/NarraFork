@@ -1,0 +1,228 @@
+name: build-self
+
+# Manual cross-platform build of THIS repository's own source.
+#
+# Run it from the Actions tab and pick the branch or tag to build. Everything is
+# compiled from the commit that triggered the run; nothing is downloaded from an
+# upstream NarraFork release, and nothing is published, tagged, committed or
+# pushed. The eight binaries arrive as this run's Actions artifacts.
+#
+# Deliberate properties, each enforced by tests/workflows/build-self.test.ts:
+#   - workflow_dispatch only, `contents: read` only, no secret is referenced
+#   - checkout pins `github.sha` of this same repository, without credentials
+#   - the validate gate must pass before any family compiles
+#   - the per-family target sets come from scripts/lib/build-targets.ts and
+#     together cover all eight targets exactly once
+#   - an artifact is uploaded only after that family passed every check
+#   - "eight-target success" is claimed only when all three families succeeded
+
+on:
+  workflow_dispatch:
+
+# Read-only: this workflow has no reason to write to the repository and must not
+# be able to create a release, move a tag or push a commit.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Validate tracked inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      short_sha: ${{ steps.identity.outputs.short_sha }}
+    steps:
+      - name: Checkout this repository at the triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Anything that transitively imports the logger creates a NarraFork home at
+      # module load, so isolate it before running any script.
+      - name: Isolate the NarraFork data directory
+        run: |
+          set -euo pipefail
+          home="$RUNNER_TEMP/narrafork-home/.narrafork"
+          mkdir -p "$home"
+          echo "NARRAFORK_HOME=$home" >> "$GITHUB_ENV"
+          echo "NARRAFORK_ALLOW_MULTIPLE=1" >> "$GITHUB_ENV"
+
+      - name: Report source identity
+        id: identity
+        run: |
+          set -euo pipefail
+          version="$(bun --print 'require("./package.json").version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "Building NarraFork $version from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      # The committed SQLite lineage is the only migration input a build may use.
+      - name: Verify tracked SQLite migration lineage
+        run: bun scripts/check-self-build.ts --mode=input
+
+      # Ordinary generation in a disposable copy must produce no new migration:
+      # a build must never ship a schema whose migration is not committed.
+      - name: Verify no uncommitted schema drift
+        run: bun scripts/check-self-build.ts --mode=drift
+
+      - name: Run self-build focused tests
+        # `finalize-sqlite-resource-migration.test.ts` is intentionally absent: one of
+        # its cases needs upstream migration fixtures that this repository's
+        # single-entry lineage does not contain. It is a known pre-existing failure,
+        # not a gate this workflow can pass, and it must not be weakened to fit.
+        run: >-
+          bun test --isolate
+          scripts/lib/__tests__/self-build-check.test.ts
+          scripts/lib/__tests__/self-build-packaging.test.ts
+          scripts/lib/__tests__/self-build-smoke.test.ts
+          scripts/lib/__tests__/bootstrap-sqlite-migrations.test.ts
+          scripts/lib/__tests__/generate-sqlite-migrations.test.ts
+          scripts/lib/__tests__/sqlite-generation-lock.test.ts
+          scripts/lib/__tests__/binary-metadata.test.ts
+          server/db/__tests__/self-build-migration-baseline.test.ts
+          server/lib/__tests__/startup-port-reclaim.test.ts
+          tests/workflows/build-self.test.ts
+
+  build:
+    name: Build ${{ matrix.family }} (${{ matrix.targets }} targets)
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      # Keep the other families' diagnostics instead of cancelling them; the
+      # summary job below is what refuses to call a partial run a full success.
+      fail-fast: false
+      matrix:
+        include:
+          - family: linux
+            runner: ubuntu-latest
+            targets: 3
+            archive_suffix: linux.tar.gz
+          - family: windows
+            runner: windows-latest
+            targets: 3
+            archive_suffix: windows.zip
+          - family: darwin
+            runner: macos-latest
+            targets: 2
+            archive_suffix: macos.tar.gz
+    steps:
+      - name: Checkout this repository at the triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Isolate the NarraFork data directory
+        run: |
+          set -euo pipefail
+          home="$RUNNER_TEMP/narrafork-home/.narrafork"
+          mkdir -p "$home"
+          echo "NARRAFORK_HOME=$home" >> "$GITHUB_ENV"
+          echo "NARRAFORK_ALLOW_MULTIPLE=1" >> "$GITHUB_ENV"
+
+      - name: Verify tracked SQLite migration lineage
+        run: bun scripts/check-self-build.ts --mode=input
+
+      # --strict turns the build's best-effort steps into gates: required
+      # @parcel/watcher bindings, per-binary metadata, and macOS ad-hoc signing
+      # plus `codesign --verify --strict` on the darwin runner.
+      - name: Build ${{ matrix.family }} targets
+        timeout-minutes: 60
+        run: bun scripts/build-cross-platform.ts --platform=${{ matrix.family }} --strict
+
+      # Fixed target set, real digests, matching sidecars and both aggregate
+      # checksum files, then packaging from an explicit allowlist. macOS ad-hoc
+      # signatures are verified natively here.
+      - name: Verify and package ${{ matrix.family }} artifacts
+        run: bun scripts/check-self-build.ts --mode=package --family=${{ matrix.family }}
+
+      # Only the targets this runner can natively execute are started, each with a
+      # fresh home and a clean CWD. Cross-compiled targets stay artifact-verified.
+      - name: Smoke test host-runnable ${{ matrix.family }} targets
+        timeout-minutes: 20
+        run: bun scripts/smoke-self-build.ts --family=${{ matrix.family }}
+
+      # Reached only when build, verification, packaging and smoke all passed.
+      - name: Upload ${{ matrix.family }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: narrafork-${{ needs.validate.outputs.version }}-${{ matrix.family }}-${{ needs.validate.outputs.short_sha }}-run${{ github.run_id }}.${{ github.run_attempt }}
+          path: |
+            dist/narrafork-${{ needs.validate.outputs.version }}-${{ matrix.archive_suffix }}
+            dist/narrafork-${{ needs.validate.outputs.version }}-SHA256SUMS
+            dist/narrafork-${{ needs.validate.outputs.version }}-checksums.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record family result
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${{ matrix.family }}: ${{ matrix.targets }} target(s) verified"
+            echo ""
+            echo "Archive: \`narrafork-${{ needs.validate.outputs.version }}-${{ matrix.archive_suffix }}\`"
+            echo "Smoke-tested natively: $RUNNER_OS/$RUNNER_ARCH host-runnable targets only."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    name: Eight-target gate
+    needs: [validate, build]
+    # Runs even when a family failed, so the result is stated rather than implied.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report build coverage
+        run: |
+          set -euo pipefail
+          version='${{ needs.validate.outputs.version }}'
+          validate='${{ needs.validate.result }}'
+          build='${{ needs.build.result }}'
+          {
+            echo "## NarraFork $version self-build — $GITHUB_SHA"
+            echo ""
+            echo "- validate gate: $validate"
+            echo "- build families: $build"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$validate" != "success" ] || [ "$build" != "success" ]; then
+            {
+              echo ""
+              echo "**PARTIAL OR FAILED RUN — this is NOT an eight-target build.**"
+              echo "Any artifact present belongs only to a family whose own checks passed."
+              echo "Check each family job before using anything from this run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Self-build did not complete all three families; refusing to report eight-target success."
+            exit 1
+          fi
+          {
+            echo ""
+            echo "All three families passed: 8 targets (Linux x64/x64-baseline/arm64,"
+            echo "Windows x64/x64-baseline/arm64, macOS arm64/x64)."
+            echo ""
+            echo "Native startup smoke covers only each runner's own architecture."
+            echo "Cross-compiled targets are verified by identity, metadata and checksums."
+            echo "macOS binaries are ad-hoc signed only; Windows binaries are unsigned."
+          } >> "$GITHUB_STEP_SUMMARY"

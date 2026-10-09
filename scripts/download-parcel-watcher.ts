@@ -9,12 +9,24 @@
  *
  * Usage:
  *   bun scripts/download-parcel-watcher.ts
+ *   bun scripts/download-parcel-watcher.ts --strict --require=linux-x64-glibc,linux-x64-musl
+ *
+ * By default a per-platform failure only warns, because a developer building one
+ * platform does not need the other seven bindings. `--strict --require=` is the
+ * self-build CI gate: the listed keys must be present and non-empty, or the
+ * download fails before anything is compiled.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Glob } from "bun";
 
 const ROOT = join(import.meta.dir, "..");
+const args = process.argv.slice(2);
+const strict = args.includes("--strict");
+const requiredKeys = (args.find((arg) => arg.startsWith("--require="))?.slice(10) ?? "")
+	.split(",")
+	.map((key) => key.trim())
+	.filter(Boolean);
 const OUT_DIR = join(ROOT, "server", "generated", "parcel-watcher-binaries");
 const LOADER_FILE = join(ROOT, "server", "generated", "parcel-native-loader.ts");
 
@@ -146,6 +158,34 @@ const failed = results.filter((r) => !r.success);
 console.log(`\n✅ Downloaded ${succeeded.length}/${results.length} platform binaries`);
 if (failed.length > 0) {
 	console.warn(`⚠ Failed: ${failed.map((r) => r.key).join(", ")}`);
+}
+
+// Strict gate: a required binding that is absent, empty or unknown must stop the
+// build here rather than produce a loader that silently lacks file watching.
+if (strict) {
+	const unknown = requiredKeys.filter((key) => !(key in PLATFORMS));
+	if (unknown.length > 0) {
+		console.error(`❌ Unknown required @parcel/watcher key(s): ${unknown.join(", ")}`);
+		process.exit(1);
+	}
+	const missing = requiredKeys.filter((key) => {
+		const path = join(OUT_DIR, `watcher-${key}.node`);
+		try {
+			const info = statSync(path);
+			return !info.isFile() || info.size === 0;
+		} catch {
+			return true;
+		}
+	});
+	if (requiredKeys.length === 0) {
+		console.error("❌ --strict requires --require=<keys>");
+		process.exit(1);
+	}
+	if (missing.length > 0) {
+		console.error(`❌ Missing required @parcel/watcher native binding(s): ${missing.join(", ")}`);
+		process.exit(1);
+	}
+	console.log(`✓ Strict: ${requiredKeys.length} required native binding(s) present`);
 }
 
 // ── Generate loader file ────────────────────────────────────────────────────

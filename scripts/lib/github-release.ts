@@ -1,22 +1,27 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
 import { copyFile, lstat, mkdtemp, opendir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isValidGitHubRepository } from "../../server/lib/settings/update-source";
 import {
-	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_PATCH_BYTES,
 	parseReleasePatchName,
 	validateReleasePatchMetadata,
 } from "../../shared/release-patch";
 import { isValidReleaseVersion } from "../../shared/release-version";
 import { type BinaryMetadata, formatChecksumsReport, formatSha256Sums } from "./binary-metadata";
+// Local artifact identity/metadata verification is shared with the self-build
+// CI checker so both enforce one format and one set of byte budgets.
+import {
+	assertBinaryMetadata,
+	assertIdentityMatchesMetadata,
+	fileIdentity,
+	MAX_BINARY_BYTES,
+	MAX_METADATA_BYTES,
+	MAX_TEXT_BYTES,
+	readTextAsset as readText,
+} from "./build-artifact-identity";
 
-const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
-const MAX_TEXT_BYTES = 1024 * 1024;
-const MAX_METADATA_BYTES = 64 * 1024;
 const MAX_ASSETS = 200;
 const MAX_PATCH_PAIRS = 64;
 const MAX_DIST_ENTRIES = 4096;
@@ -89,43 +94,6 @@ export interface GitHubReleaseOptions {
 	changelog?: string | Record<string, string>;
 	dryRun?: boolean;
 	run?: GhRunner;
-}
-
-async function fileIdentity(
-	path: string,
-	maximum: number,
-): Promise<{ size: number; sha256: string; sha512: string }> {
-	const stat = await lstat(path);
-	if (!stat.isFile() || stat.size === 0 || stat.size > maximum) {
-		throw new Error(`Invalid asset size/type: ${path}`);
-	}
-	const sha256 = createHash("sha256");
-	const sha512 = createHash("sha512");
-	let size = 0;
-	for await (const chunk of createReadStream(path)) {
-		size += chunk.length;
-		if (size > maximum) throw new Error(`Asset exceeds size limit: ${path}`);
-		sha256.update(chunk);
-		sha512.update(chunk);
-	}
-	if (size !== stat.size) throw new Error(`Asset changed while reading: ${path}`);
-	return { size, sha256: sha256.digest("hex"), sha512: sha512.digest("base64") };
-}
-
-async function readText(path: string, maximum = MAX_TEXT_BYTES): Promise<string> {
-	const stat = await lstat(path);
-	if (!stat.isFile() || stat.size === 0 || stat.size > maximum) {
-		throw new Error(`Invalid text asset size/type: ${path}`);
-	}
-	const chunks: Buffer[] = [];
-	let size = 0;
-	for await (const chunk of createReadStream(path)) {
-		size += chunk.length;
-		if (size > maximum) throw new Error(`Text asset exceeds size limit: ${path}`);
-		chunks.push(chunk);
-	}
-	if (size !== stat.size) throw new Error(`Text asset changed while reading: ${path}`);
-	return Buffer.concat(chunks, size).toString("utf8");
 }
 
 /** Bound directory traversal and reject malformed/orphaned patches for selected platforms only. */
@@ -243,33 +211,16 @@ async function stageAssets(options: GitHubReleaseOptions, directory: string): Pr
 		const raw = await readText(join(options.distDir, metadataName), MAX_METADATA_BYTES);
 		const metadata = JSON.parse(raw) as BinaryMetadata;
 		const target = `bun-${platform.replace(/^win-/, "windows-")}`;
-		if (
-			metadata.name !== name ||
-			metadata.version !== options.version ||
-			metadata.platform !== platform ||
-			metadata.target !== target ||
-			!metadata.commit ||
-			!/^[a-f0-9]{7,40}$/.test(metadata.commit) ||
-			!options.commit.startsWith(metadata.commit) ||
-			!metadata.buildDate ||
-			!Number.isFinite(Date.parse(metadata.buildDate)) ||
-			!Number.isSafeInteger(metadata.size) ||
-			metadata.size <= 0 ||
-			!/^[a-f0-9]{64}$/.test(metadata.sha256) ||
-			!/^[A-Za-z0-9+/]{86}==$/.test(metadata.sha512)
-		)
-			throw new Error(`Invalid binary metadata/provenance: ${metadataName}`);
+		assertBinaryMetadata(
+			metadata,
+			{ name, version: options.version, platform, target, commit: options.commit },
+			metadataName,
+		);
 		await fileIdentity(binaryPath, MAX_BINARY_BYTES);
 		const staged = join(directory, name);
 		await copyFile(binaryPath, staged);
 		const identity = await fileIdentity(staged, MAX_BINARY_BYTES);
-		if (
-			identity.size !== metadata.size ||
-			identity.sha256 !== metadata.sha256 ||
-			identity.sha512 !== metadata.sha512
-		) {
-			throw new Error(`Binary size/hash mismatch: ${name}`);
-		}
+		assertIdentityMatchesMetadata(identity, metadata, name);
 		await writeFile(join(directory, metadataName), raw);
 		entries.push(metadata);
 		assets.push({ name, path: staged, size: identity.size, sha256: identity.sha256 });

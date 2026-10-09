@@ -5,6 +5,13 @@
  *   bun scripts/build-cross-platform.ts                    # build all platforms
  *   bun scripts/build-cross-platform.ts --platform=darwin-arm64  # specific platform
  *   bun scripts/build-cross-platform.ts --skip-frontend    # skip Vite build
+ *   bun scripts/build-cross-platform.ts --strict           # self-build CI gates
+ *
+ * `--strict` turns the best-effort steps into hard gates: the native watcher
+ * bindings the selected targets need must exist, every selected binary must get
+ * sidecar metadata, the aggregate checksum files must be written, and macOS
+ * ad-hoc signing must succeed. Without it the default, backward-compatible
+ * behaviour (warn and continue) is unchanged.
  */
 import { execSync } from "node:child_process";
 import {
@@ -24,7 +31,10 @@ import {
 	formatChecksumsReport,
 	formatSha256Sums,
 } from "./lib/binary-metadata";
+import { BUILD_TARGETS, binaryName, requiredWatcherKeys } from "./lib/build-targets";
 import { formatLatestYmlFiles, type LatestYmlEntry } from "./lib/latest-yml";
+import { assertWatcherBindings, checkSqliteMigrations } from "./lib/self-build-check";
+import { assertNoSqliteBootstrap } from "./lib/sqlite-initial-migration";
 
 const ROOT = join(import.meta.dir, "..");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
@@ -51,21 +61,17 @@ const DIST_DIR = join(ROOT, "dist");
 // Parse CLI arguments
 const args = process.argv.slice(2);
 const skipFrontend = args.includes("--skip-frontend");
+const strict = args.includes("--strict");
 const platformArg = args.find((a) => a.startsWith("--platform="))?.split("=")[1];
 
-// Available platforms
-// NOTE: platformId must match the format returned by getPlatform() in update-service.ts
-// (e.g. "darwin-arm64", "win-x64", "linux-x64-baseline")
-const PLATFORMS = [
-	{ target: "bun-darwin-arm64", platformId: "darwin-arm64", name: `narrafork-${VERSION}-macos-arm64` },
-	{ target: "bun-darwin-x64", platformId: "darwin-x64", name: `narrafork-${VERSION}-macos-x64` },
-	{ target: "bun-linux-x64", platformId: "linux-x64", name: `narrafork-${VERSION}-linux-x64` },
-	{ target: "bun-linux-x64-baseline", platformId: "linux-x64-baseline", name: `narrafork-${VERSION}-linux-x64-baseline` },
-	{ target: "bun-linux-arm64", platformId: "linux-arm64", name: `narrafork-${VERSION}-linux-arm64` },
-	{ target: "bun-windows-x64", platformId: "win-x64", name: `narrafork-${VERSION}-windows-x64.exe` },
-	{ target: "bun-windows-x64-baseline", platformId: "win-x64-baseline", name: `narrafork-${VERSION}-windows-x64-baseline.exe` },
-	{ target: "bun-windows-arm64", platformId: "win-arm64", name: `narrafork-${VERSION}-windows-arm64.exe` },
-];
+// Available platforms. The target table lives in ./lib/build-targets.ts so the
+// self-build checker enumerates exactly what this script builds.
+const PLATFORMS = BUILD_TARGETS.map((entry) => ({
+	target: entry.target,
+	platformId: entry.platformId,
+	name: binaryName(VERSION, entry),
+	family: entry.family,
+}));
 
 const selectedPlatforms = platformArg
 	? PLATFORMS.filter((p) => {
@@ -87,10 +93,16 @@ if (selectedPlatforms.length === 0) {
 	process.exit(1);
 }
 
+// Refuse failed bootstrap state even outside CI. Strict builds validate before
+// frontend generation/downloads, not only when the workflow called a checker first.
+assertNoSqliteBootstrap(DRIZZLE_DIR);
+if (strict) checkSqliteMigrations(DRIZZLE_DIR);
+
 // Step 1: Build frontend with Vite
 if (!skipFrontend) {
 	console.log("→ Building frontend...");
 	const vite = Bun.spawnSync(["bunx", "vite", "build", "--config", "frontend/vite.config.ts"], {
+		timeout: strict ? 15 * 60_000 : undefined,
 		cwd: ROOT,
 		stdio: ["inherit", "inherit", "inherit"],
 	});
@@ -104,13 +116,35 @@ if (!skipFrontend) {
 // Step 1b: Download @parcel/watcher native binaries for all platforms
 {
 	console.log("→ Downloading @parcel/watcher native binaries...");
-	const dl = Bun.spawnSync(["bun", "scripts/download-parcel-watcher.ts"], {
-		cwd: ROOT,
-		stdio: ["inherit", "inherit", "inherit"],
-	});
+	const selectedTargets = BUILD_TARGETS.filter((entry) =>
+		selectedPlatforms.some((platform) => platform.target === entry.target),
+	);
+	const dl = Bun.spawnSync(
+		[
+			"bun",
+			"scripts/download-parcel-watcher.ts",
+			...(strict
+				? ["--strict", `--require=${requiredWatcherKeys(selectedTargets).join(",")}`]
+				: []),
+		],
+		{
+			timeout: strict ? 10 * 60_000 : undefined,
+			cwd: ROOT,
+			stdio: ["inherit", "inherit", "inherit"],
+		},
+	);
 	if (dl.exitCode !== 0) {
 		console.error("❌ @parcel/watcher binary download failed");
 		process.exit(1);
+	}
+	// Independent check point between "native dependencies downloaded" and "compile":
+	// the ordinary download path tolerates partial failures, a distribution cannot.
+	if (strict) {
+		const present = assertWatcherBindings(
+			join(ROOT, "server", "generated", "parcel-watcher-binaries"),
+			selectedTargets,
+		);
+		console.log(`✓ Strict: required watcher bindings present (${present.join(", ")})`);
 	}
 }
 
@@ -174,7 +208,11 @@ type DrizzleJournal = {
 
 if (!existsSync(DRIZZLE_JOURNAL_PATH)) {
 	console.error(`❌ Drizzle migration journal not found: ${relative(ROOT, DRIZZLE_JOURNAL_PATH)}`);
-	console.error("Run `bun run db:generate` first, then re-run the build.");
+	console.error(
+		"The SQLite lineage is tracked in git. In a clean checkout this file must already exist; " +
+			"run `bun run db:generate` only after changing server/db/schema.ts, and commit the result. " +
+			"`bun run db:bootstrap` is a one-time initial-lineage command and refuses an existing drizzle/.",
+	);
 	process.exit(1);
 }
 
@@ -395,6 +433,7 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			outfile,
 		],
 		{
+			timeout: strict ? 20 * 60_000 : undefined,
 			cwd: ROOT,
 			stdio: ["inherit", "inherit", "inherit"],
 		},
@@ -417,6 +456,10 @@ console.log(`\n✓ All ${selectedPlatforms.length} platforms compiled in ${compi
 interface WorkerResult {
 	latestYml: LatestYmlEntry;
 	metadata?: BinaryMetadata;
+	/** macOS only: ad-hoc signing succeeded. */
+	signed?: boolean;
+	/** macOS only: `codesign --verify` passed on a native host; null when not verifiable. */
+	signatureVerified?: boolean | null;
 }
 
 function runPostProcessWorker(
@@ -430,8 +473,16 @@ function runPostProcessWorker(
 				root: ROOT,
 				version: VERSION,
 				commit: commitHash,
+				strict,
 			},
 		});
+
+		const timer = strict
+			? setTimeout(() => {
+					void worker.terminate();
+					reject(new Error(`Post-processing timed out for ${platform.platformId}`));
+				}, 10 * 60_000)
+			: undefined;
 
 		worker.on(
 			"message",
@@ -440,22 +491,38 @@ function runPostProcessWorker(
 				message?: string;
 				latestYml?: LatestYmlEntry;
 				metadata?: BinaryMetadata;
+				signed?: boolean;
+				signatureVerified?: boolean | null;
 			}) => {
 				if (msg.type === "log") {
 					console.log(`  [${platform.platformId}] ${msg.message}`);
 				} else if (msg.type === "done") {
 					if (!msg.latestYml) {
-						reject(new Error(`Worker for ${platform.platformId} completed without latest.yml data`));
+						reject(
+							new Error(`Worker for ${platform.platformId} completed without latest.yml data`),
+						);
 						return;
 					}
-					resolve({ latestYml: msg.latestYml, metadata: msg.metadata });
+					resolve({
+						latestYml: msg.latestYml,
+						metadata: msg.metadata,
+						signed: msg.signed,
+						signatureVerified: msg.signatureVerified,
+					});
 				}
 			},
 		);
 
-		worker.on("error", reject);
+		worker.on("error", (error) => {
+			clearTimeout(timer);
+			reject(error);
+		});
 		worker.on("exit", (code) => {
-			if (code !== 0) reject(new Error(`Worker for ${platform.platformId} exited with code ${code}`));
+			clearTimeout(timer);
+			if (strict || code !== 0)
+				reject(
+					new Error(`Worker for ${platform.platformId} exited without completing (code ${code})`),
+				);
 		});
 	});
 }
@@ -474,10 +541,28 @@ for (const [name, content] of latestYmlFiles) {
 console.log(`\n✓ Post-processing completed in ${postMs}ms`);
 
 // Write aggregate checksum files (verifiable provenance for every binary).
-// Best-effort: a failure here must not fail the build.
+// Best-effort by default; `--strict` makes incomplete provenance fail the build.
 const metadataEntries = results
 	.map((r) => r.metadata)
 	.filter((m): m is BinaryMetadata => m !== undefined);
+
+if (strict) {
+	if (metadataEntries.length !== selectedPlatforms.length) {
+		console.error(
+			`❌ Strict: ${selectedPlatforms.length - metadataEntries.length} of ${selectedPlatforms.length} binaries have no sidecar metadata`,
+		);
+		process.exit(1);
+	}
+	const unsigned = selectedPlatforms.filter(
+		(platform, index) => platform.target.includes("darwin") && results[index].signed !== true,
+	);
+	if (unsigned.length > 0) {
+		console.error(
+			`❌ Strict: macOS ad-hoc signing failed for ${unsigned.map((p) => p.platformId).join(", ")}`,
+		);
+		process.exit(1);
+	}
+}
 
 const aggregateFiles: string[] = [];
 if (metadataEntries.length > 0) {
@@ -492,6 +577,10 @@ if (metadataEntries.length > 0) {
 		);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
+		if (strict) {
+			console.error(`❌ Strict: failed to write aggregate checksum files: ${message}`);
+			process.exit(1);
+		}
 		console.warn(`⚠ Failed to write aggregate checksum files: ${message}`);
 	}
 } else {
