@@ -294,7 +294,7 @@ process.on("unhandledRejection", (reason) => {
 	logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
 });
 
-// CLI flags: --port=XXXX --host=XXXX
+// CLI flags: --port=XXXX --host=XXXX --no-port-reclaim (checked at the reclamation boundary)
 const cliPort = process.argv.find((a) => a.startsWith("--port="))?.split("=")[1];
 const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1];
 
@@ -559,7 +559,8 @@ function parseWmicProcessCsv(output: string): WindowsProcessInfo[] {
 }
 
 function tryReclaimPort(targetPort: number): void {
-	if (!IS_WINDOWS) return;
+	// Isolated probes must never scan or kill another listener, even if called directly.
+	if (!IS_WINDOWS || process.argv.includes("--no-port-reclaim")) return;
 	try {
 		// netstat -ano gives lines like:
 		//   TCP    0.0.0.0:7778           0.0.0.0:0              LISTENING       12345
@@ -1156,7 +1157,11 @@ if (portExplicit) {
 		_server = startServerWithHostFallback(port);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
-		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+		if (
+			(typeof err === "object" && err !== null && "code" in err && err.code === "EADDRINUSE") ||
+			msg.includes("EADDRINUSE") ||
+			msg.includes("address already in use")
+		) {
 			logger.error(`Port ${port} is already in use. Cannot start server.`);
 			console.error(
 				`\x1b[31mError: Port ${port} is already in use.\x1b[0m\nPlease free the port or choose a different one with --port=XXXX.`,
