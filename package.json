@@ -125,6 +125,7 @@
 		"plugins:validate-release": "bun scripts/validate-plugin-release.ts",
 		"check": "bunx @biomejs/biome check .",
 		"db:generate": "bun scripts/generate-sqlite-migrations.ts",
+		"db:bootstrap": "bun scripts/generate-sqlite-migrations.ts --bootstrap",
 		"db:generate:pg": "bun scripts/postgres-migrations.ts generate",
 		"db:check:pg": "bun scripts/postgres-migrations.ts check",
 		"db:baseline:pg": "bun scripts/postgres-migrations.ts baseline",
