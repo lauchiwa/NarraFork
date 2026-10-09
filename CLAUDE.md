@@ -24,6 +24,7 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 | `bun run start` | 生产环境：运行数据库迁移 + 启动后端 + 静态前端 |
 | `bun run db:generate` | 生成 Drizzle 迁移 SQL 文件 |
 | `bun run db:migrate` | 执行 `./drizzle/` 中的迁移 |
+| `bun run db:bootstrap` | 一次性建立 SQLite 初始基线；`drizzle/` 已存在时拒绝（本仓库已完成，日常不用） |
 | `bun run db:generate:pg --name <name>` | 在隔离目录生成PG增量迁移并更新唯一当前快照 |
 | `bun run db:check:pg` | 检查PG迁移谱系及原生Drizzle当前基线 |
 | `bun run db:baseline:pg` | 将旧PG多快照结构收敛为单基线（不是SQL squash） |
@@ -55,9 +56,11 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 **数据库迁移规则（严格遵守）：**
 - **禁止手动修改 `drizzle/` 目录下的任何文件**（包括 SQL 迁移文件和 `meta/` 下的 journal/snapshot）
 - 修改数据库结构的唯一正确流程：先修改 `server/db/schema.ts`，然后运行 `bun run db:generate` 自动生成迁移文件
+- **SQLite 迁移必须随源码纳入版本控制**（`drizzle/*.sql`、`meta/_journal.json`、`meta/*_snapshot.json`，LF 固定）：生成的增量迁移要连同 snapshot/journal 一起提交；已发布的迁移不得改写、重排或 squash，回退结构追加补偿迁移。自构建 CI 运行 `bun scripts/check-self-build.ts --mode=input` 和 `--mode=drift`：前者只读验证，后者只在临时副本生成并检查漂移，不用临时输出构建。
+- **bootstrap 例外（仅此一条）：** `bun run db:bootstrap` 只用于在 `drizzle/` 完全不存在时建立初始基线。不得为了让它运行而删除/移动 `drizzle/`，也不得用它替代 `db:generate`；失败留下的 `_bootstrap_pending.json` 会阻止生成和构建，应交由用户处理，不要自动清除。
 - **代码评审特殊规则：** 如果评审中的改动修改了 `server/db/schema.ts` 但尚未生成对应迁移，**不要**把“未生成迁移”列为阻塞项或必须修复项；最多作为非阻塞提醒说明“合并/发布前需要生成迁移”。评审应优先确认 schema 设计和业务逻辑正确，迁移可在评审通过后再生成。
 - **⚠️ 禁止自行删除数据库文件（`~/.narrafork/narrafork.db*`）或 `drizzle/` 目录** — 数据库包含用户数据，删除不可逆。迁移失败时应先尝试修复（如关闭外键检查、调整迁移顺序等），必须由用户明确授权后才能执行删除操作
-- 如用户明确要求全新迁移：删除 `drizzle/` 目录和数据库文件（`~/.narrafork/narrafork.db*`），再运行 `bun run db:generate` + `bun run db:migrate`
+- 如用户要求重建迁移谱系，先说明这不是既有数据的升级路径，且通常应使用独立副本和全新数据目录。只有用户明确确认删除的具体目录后才可清理；输出目录确实不存在时使用 `bun run db:bootstrap`，不再用缺少历史就会失败的 `db:generate`。不得将“重建迁移”理解为自动授权删除默认 `~/.narrafork/` 数据库；迁移执行也必须另行确认目标数据目录。
 
 **PostgreSQL 迁移元数据规则：**
 - `drizzle-postgres/` 保留全部增量SQL和journal，但全量schema只保留固定的 `meta/current_snapshot.json`；`meta/_snapshot_history.json` 保存小型谱系记录，不增加历史全量快照或压缩归档。
